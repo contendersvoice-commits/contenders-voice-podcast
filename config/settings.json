@@ -1,0 +1,19 @@
+{
+  "substack_subdomain": "contendersvoice",
+  "show_title": "Contender's Voice",
+  "show_subtitle": "Weekly Torah Portion (Parsha) Studies & Biblical Restoration",
+  "show_description": "Audio editions of Contender's Voice by Hutch Church — weekly Torah portion (Parsha) studies and Spirit-led discipleship for believers restoring their biblical, Hebraic foundations.",
+  "author": "Hutch Church",
+  "owner_name": "Contender's Voice",
+  "owner_email": "contendersvoice@substack.com",
+  "website_url": "https://www.contendersvoice.com/",
+  "substack_url": "https://contendersvoice.substack.com/",
+  "show_logo_source_url": "https://substack-post-media.s3.amazonaws.com/public/images/f71c29b2-a0d6-48c4-847e-0d9e61deb66b_4021x4021.png",
+  "voice": "en-US-AndrewMultilingualNeural",
+  "rate": "-3%",
+  "mp3_bitrate": "64k",
+  "sample_rate": 44100,
+  "github_owner": "contendersvoice-commits",
+  "github_repo": "contenders-voice-podcast",
+  "release_tag": "audio-archive"
+}

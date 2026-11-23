@@ -1,0 +1,67 @@
+name: Sync Substack Podcast
+
+on:
+  schedule:
+    # Run every 2 hours at :15 past the hour
+    - cron: "15 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      max_new_episodes:
+        description: "Max new episodes to generate this run (use 2 for test, or 15-20 per batch for backfill)"
+        required: false
+        default: "5"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure FFmpeg and Python dependencies are installed
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure audio-archive GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view audio-archive || gh release create audio-archive \
+            --title "Contender's Voice Audio Archive" \
+            --notes "Automated MP3 audio editions of Contender's Voice Substack posts."
+
+      - name: Sync Substack posts to Podcast MP3s and RSS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LIMIT="${{ github.event.inputs.max_new_episodes }}"
+          if [ -z "$LIMIT" ]; then
+            LIMIT="5"
+          fi
+          python src/sync_podcast.py --publish-releases --limit "$LIMIT"
+
+      - name: Commit updated state and RSS feed
+        run: |
+          git config user.name "Contender's Voice Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/episodes.json docs/
+          if ! git diff --cached --quiet; then
+            git commit -m "Sync Contender's Voice podcast feed"
+            git push
+          else
+            echo "No feed changes to commit."
+          fi

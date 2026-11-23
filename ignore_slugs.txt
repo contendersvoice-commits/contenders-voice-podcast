@@ -1,0 +1,13 @@
+# Episode Deletion / Exclusion List
+# ----------------------------------
+# Add one Substack post slug per line to permanently exclude an episode from
+# your Podcast RSS feed and prevent it from being re-generated automatically.
+#
+# How to find a post's slug:
+#   Look at the end of its Substack URL after "/p/".
+#   Example: https://contendersvoice.substack.com/p/weekly-parsha-points-vayishlach-he
+#   Slug:    weekly-parsha-points-vayishlach-he
+#
+# Lines starting with # are comments and are ignored.
+# After editing this file on GitHub, either wait for the next sync or run:
+#   Actions -> Sync Substack Podcast -> Run workflow (or locally: python src/sync_podcast.py --rebuild-only)
