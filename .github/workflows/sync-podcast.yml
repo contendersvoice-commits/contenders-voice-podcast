@@ -17,10 +17,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: podcast-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -47,6 +51,7 @@ jobs:
             --notes "Automated MP3 audio editions of Contender's Voice Substack posts."
 
       - name: Sync Substack posts to Podcast MP3s and RSS
+        id: sync
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -54,7 +59,11 @@ jobs:
           if [ -z "$LIMIT" ]; then
             LIMIT="5"
           fi
-          python src/sync_podcast.py --publish-releases --limit "$LIMIT"
+          set +e
+          python src/sync_podcast.py --publish-releases --limit "$LIMIT" --order oldest
+          SYNC_EXIT=$?
+          set -e
+          echo "sync_exit=$SYNC_EXIT" >> "$GITHUB_OUTPUT"
 
       - name: Commit updated state and RSS feed
         run: |
@@ -67,3 +76,9 @@ jobs:
           else
             echo "No feed changes to commit."
           fi
+
+      - name: Fail workflow if any episode had an error
+        if: steps.sync.outputs.sync_exit != '0'
+        run: |
+          echo "One or more episodes failed (exit ${{ steps.sync.outputs.sync_exit }}); successful episodes were saved."
+          exit "${{ steps.sync.outputs.sync_exit }}"

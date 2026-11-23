@@ -135,6 +135,67 @@ def _verify_chunk_completeness(
             )
 
 
+def _bisect_text(text: str) -> tuple[str, str] | None:
+    """Split a chunk > 220 chars roughly in half at a paragraph or sentence boundary."""
+    if len(text) <= 220:
+        return None
+    mid = len(text) // 2
+
+    # Try paragraph boundaries first
+    para_breaks = [m.start() for m in re.finditer(r"\n\s*\n", text)]
+    if para_breaks:
+        best = min(para_breaks, key=lambda pos: abs(pos - mid))
+        left = text[:best].strip()
+        right = text[best:].strip()
+        if len(left) >= 20 and len(right) >= 20:
+            return left, right
+
+    # Fall back to sentence boundaries
+    sent_breaks = [m.end() for m in re.finditer(r'(?:(?<=[.!?]["”’\')])|(?<=[.!?]))\s+', text)]
+    if sent_breaks:
+        best = min(sent_breaks, key=lambda pos: abs(pos - mid))
+        left = text[:best].strip()
+        right = text[best:].strip()
+        if len(left) >= 20 and len(right) >= 20:
+            return left, right
+
+    return None
+
+
+def _concat_mp3_pair(part_a: Path, part_b: Path, dest_path: Path, sample_rate: int = 44100) -> None:
+    """Join two MP3 halves cleanly into dest_path using FFmpeg filter_complex."""
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(part_a),
+            "-i",
+            str(part_b),
+            "-filter_complex",
+            (
+                f"[0:a]aresample={sample_rate},aformat=sample_fmts=fltp:channel_layouts=mono[a0];"
+                f"[1:a]aresample={sample_rate},aformat=sample_fmts=fltp:channel_layouts=mono[a1];"
+                "[a0][a1]concat=n=2:v=0:a=1,asetpts=N/SR/TB[out]"
+            ),
+            "-map",
+            "[out]",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "64k",
+            "-ar",
+            str(sample_rate),
+            "-ac",
+            "1",
+            str(dest_path),
+        ],
+        check=True,
+    )
+
+
 async def _synthesize_chunk_with_retry(
     text: str,
     voice: str,
@@ -143,6 +204,7 @@ async def _synthesize_chunk_with_retry(
     attempts: int = 4,
     idle_timeout_sec: float = 25.0,
     total_timeout_sec: float = 180.0,
+    allow_bisect: bool = True,
 ) -> None:
     last_err: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -161,6 +223,42 @@ async def _synthesize_chunk_with_retry(
         except Exception as exc:
             dest_path.unlink(missing_ok=True)
             last_err = exc
+            if attempt == 2 and allow_bisect:
+                split = _bisect_text(text)
+                if split is not None:
+                    print(
+                        f"    Splitting {dest_path.name} into two halves after retry failure...",
+                        flush=True,
+                    )
+                    part_a = dest_path.with_name(f"{dest_path.stem}_a.mp3")
+                    part_b = dest_path.with_name(f"{dest_path.stem}_b.mp3")
+                    try:
+                        await _synthesize_chunk_with_retry(
+                            split[0],
+                            voice,
+                            rate,
+                            part_a,
+                            attempts=3,
+                            idle_timeout_sec=idle_timeout_sec,
+                            total_timeout_sec=total_timeout_sec,
+                            allow_bisect=False,
+                        )
+                        await _synthesize_chunk_with_retry(
+                            split[1],
+                            voice,
+                            rate,
+                            part_b,
+                            attempts=3,
+                            idle_timeout_sec=idle_timeout_sec,
+                            total_timeout_sec=total_timeout_sec,
+                            allow_bisect=False,
+                        )
+                        _concat_mp3_pair(part_a, part_b, dest_path)
+                        _probe_mp3(dest_path)
+                        return
+                    finally:
+                        part_a.unlink(missing_ok=True)
+                        part_b.unlink(missing_ok=True)
             if attempt < attempts:
                 print(
                     f"    Retry {attempt}/{attempts - 1} for {dest_path.name} ({exc})...",

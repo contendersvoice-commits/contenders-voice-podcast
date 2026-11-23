@@ -264,6 +264,12 @@ def main() -> int:
         default=5,
         help="Max new episodes to synthesize per run (default: 5).",
     )
+    parser.add_argument(
+        "--order",
+        choices=["oldest", "newest"],
+        default="oldest",
+        help="Order to process pending episodes (default: oldest).",
+    )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--local-only",
@@ -321,6 +327,7 @@ def main() -> int:
         print("Preparing 1400x1400 show cover artwork...")
         prepare_square_artwork(settings["show_logo_source_url"], show_cover_path)
 
+    failed_slugs: list[str] = []
     if not args.rebuild_only:
         if args.publish_releases and (not owner or owner == "REPLACE_WITH_GITHUB_USERNAME"):
             raise RuntimeError(
@@ -337,9 +344,13 @@ def main() -> int:
             and p["slug"] not in episodes
             and p["slug"] not in ignored_slugs
         ]
+        pending.sort(
+            key=lambda p: p.get("post_date", ""),
+            reverse=(args.order == "newest"),
+        )
         print(
             f"Found {len(all_posts)} written posts total; "
-            f"{len(pending)} pending synthesis (limit={args.limit})."
+            f"{len(pending)} pending synthesis (order={args.order}, limit={args.limit})."
         )
 
         to_process = pending[: max(0, args.limit)]
@@ -347,84 +358,89 @@ def main() -> int:
             slug = post["slug"]
             post_url = post.get("post_url") or f"https://{settings['substack_subdomain']}.substack.com/p/{slug}"
             print(f"[{idx}/{len(to_process)}] Processing {slug}...")
-
-            title = clean_post_title(post.get("title") or slug)
-            subtitle = (post.get("subtitle") or "").strip()
-            pub_date = post.get("post_date") or ""
-            year = pub_date[:4] if len(pub_date) >= 4 else ""
-            raw_html = post.get("body_html") or ""
-            cover_url = post.get("cover_image") or ""
-
-            cleaned_soup = clean_substack_html(raw_html)
-
-            ep_art_path = artwork_dir / f"{slug}.jpg"
-            has_ep_art = False
-            if cover_url:
-                try:
-                    has_ep_art = prepare_square_artwork(cover_url, ep_art_path)
-                except Exception as exc:
-                    print(f"  Warning: could not process cover image for {slug} ({exc}); using show cover.")
-            if not has_ep_art:
-                shutil.copy2(show_cover_path, ep_art_path)
-
-            ep_art_url = f"artwork/{slug}.jpg" if args.local_only else f"{base_pages_url}/artwork/{slug}.jpg"
-
-            content_html = build_show_notes_html(
-                post_title=title,
-                post_url=post_url,
-                cleaned_soup=cleaned_soup,
-                artwork_url=cover_url or ep_art_url,
-            )
-            body_chunks, outro_text = build_spoken_chunks(
-                title=title,
-                subtitle=subtitle,
-                cleaned_soup=cleaned_soup,
-                pronunciations=pronunciations,
-            )
-
             mp3_path = audio_dir / f"{slug}.mp3"
-            duration_sec, audio_bytes = synthesize_and_master_mp3(
-                body_chunks=body_chunks,
-                outro_text=outro_text,
-                output_mp3=mp3_path,
-                voice=settings["voice"],
-                rate=settings["rate"],
-                title=title,
-                artist=settings["author"],
-                album=settings["show_title"],
-                year=year,
-                artwork_path=ep_art_path,
-                bitrate=settings["mp3_bitrate"],
-                sample_rate=int(settings["sample_rate"]),
-            )
-            print(f"  Mastered MP3: {duration_sec}s, {audio_bytes / (1024*1024):.2f} MB")
 
-            if args.publish_releases:
-                audio_url = upload_to_github_release(
-                    mp3_path, settings["release_tag"], owner, repo
+            try:
+                title = clean_post_title(post.get("title") or slug)
+                subtitle = (post.get("subtitle") or "").strip()
+                pub_date = post.get("post_date") or ""
+                year = pub_date[:4] if len(pub_date) >= 4 else ""
+                raw_html = post.get("body_html") or ""
+                cover_url = post.get("cover_image") or ""
+
+                cleaned_soup = clean_substack_html(raw_html)
+
+                ep_art_path = artwork_dir / f"{slug}.jpg"
+                has_ep_art = False
+                if cover_url:
+                    try:
+                        has_ep_art = prepare_square_artwork(cover_url, ep_art_path)
+                    except Exception as exc:
+                        print(f"  Warning: could not process cover image for {slug} ({exc}); using show cover.")
+                if not has_ep_art:
+                    shutil.copy2(show_cover_path, ep_art_path)
+
+                ep_art_url = f"artwork/{slug}.jpg" if args.local_only else f"{base_pages_url}/artwork/{slug}.jpg"
+
+                content_html = build_show_notes_html(
+                    post_title=title,
+                    post_url=post_url,
+                    cleaned_soup=cleaned_soup,
+                    artwork_url=cover_url or ep_art_url,
                 )
-                mp3_path.unlink(missing_ok=True)
-            else:
-                audio_url = mp3_path.resolve().as_uri()
+                body_chunks, outro_text = build_spoken_chunks(
+                    title=title,
+                    subtitle=subtitle,
+                    cleaned_soup=cleaned_soup,
+                    pronunciations=pronunciations,
+                )
 
-            episodes[slug] = {
-                "slug": slug,
-                "title": title,
-                "subtitle": subtitle,
-                "post_url": post_url,
-                "pub_date": pub_date,
-                "summary": _build_plain_summary(subtitle, cleaned_soup),
-                "content_html": content_html,
-                "audio_url": audio_url,
-                "audio_bytes": audio_bytes,
-                "duration_sec": duration_sec,
-                "artwork_url": ep_art_url,
-                "local_audio_rel": f"audio/{slug}.mp3",
-                "local_artwork_rel": f"artwork/{slug}.jpg",
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            save_json(state_file, state)
-            time.sleep(0.25)
+                duration_sec, audio_bytes = synthesize_and_master_mp3(
+                    body_chunks=body_chunks,
+                    outro_text=outro_text,
+                    output_mp3=mp3_path,
+                    voice=settings["voice"],
+                    rate=settings["rate"],
+                    title=title,
+                    artist=settings["author"],
+                    album=settings["show_title"],
+                    year=year,
+                    artwork_path=ep_art_path,
+                    bitrate=settings["mp3_bitrate"],
+                    sample_rate=int(settings["sample_rate"]),
+                )
+                print(f"  Mastered MP3: {duration_sec}s, {audio_bytes / (1024*1024):.2f} MB")
+
+                if args.publish_releases:
+                    audio_url = upload_to_github_release(
+                        mp3_path, settings["release_tag"], owner, repo
+                    )
+                    mp3_path.unlink(missing_ok=True)
+                else:
+                    audio_url = mp3_path.resolve().as_uri()
+
+                episodes[slug] = {
+                    "slug": slug,
+                    "title": title,
+                    "subtitle": subtitle,
+                    "post_url": post_url,
+                    "pub_date": pub_date,
+                    "summary": _build_plain_summary(subtitle, cleaned_soup),
+                    "content_html": content_html,
+                    "audio_url": audio_url,
+                    "audio_bytes": audio_bytes,
+                    "duration_sec": duration_sec,
+                    "artwork_url": ep_art_url,
+                    "local_audio_rel": f"audio/{slug}.mp3",
+                    "local_artwork_rel": f"artwork/{slug}.jpg",
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                save_json(state_file, state)
+                time.sleep(0.25)
+            except Exception as exc:
+                mp3_path.unlink(missing_ok=True)
+                failed_slugs.append(slug)
+                print(f"  ERROR processing {slug}: {exc}", file=sys.stderr)
 
     rss_count = build_podcast_rss(
         settings=settings,
@@ -443,6 +459,9 @@ def main() -> int:
         local_preview=args.local_only,
     )
     print(f"Built {out_xml} ({rss_count} episodes) and {out_html} ({html_count} episodes).")
+    if failed_slugs:
+        print(f"FAILED_EPISODES: {', '.join(failed_slugs)}", file=sys.stderr)
+        return 1
     return 0
 
 

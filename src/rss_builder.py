@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from email.utils import format_datetime
+from email.utils import format_datetime, parsedate_to_datetime
 from html import escape
 from pathlib import Path
 import re
 from typing import Any, Mapping
+import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
 
@@ -49,6 +50,55 @@ def _active_sorted_episodes(
     ]
     active.sort(key=lambda ep: ep.get("pub_date", ""), reverse=True)
     return active
+
+
+def validate_podcast_xml(xml_path: Path) -> None:
+    """Validate Podcast RSS 2.0 XML syntax, required tags, enclosures, and clean HTML."""
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    channel = root.find("channel")
+    if channel is None:
+        raise ValueError("Invalid RSS: missing <channel>")
+
+    if not (channel.findtext("title") or "").strip():
+        raise ValueError("Invalid RSS: missing channel <title>")
+
+    ns = {
+        "itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd",
+        "content": "http://purl.org/rss/1.0/modules/content/",
+    }
+    ch_img = channel.find("itunes:image", ns)
+    if ch_img is None or not (ch_img.get("href") or "").strip():
+        raise ValueError("Invalid RSS: missing channel <itunes:image>")
+
+    for idx, item in enumerate(channel.findall("item"), 1):
+        title = (item.findtext("title") or "").strip()
+        if not title:
+            raise ValueError(f"Invalid RSS item #{idx}: empty <title>")
+
+        pub_raw = (item.findtext("pubDate") or "").strip()
+        if not pub_raw:
+            raise ValueError(f"Invalid RSS item {title!r}: missing <pubDate>")
+        parsedate_to_datetime(pub_raw)
+
+        enc = item.find("enclosure")
+        if enc is None:
+            raise ValueError(f"Invalid RSS item {title!r}: missing <enclosure>")
+        if enc.get("type") != "audio/mpeg":
+            raise ValueError(f"Invalid RSS item {title!r}: bad enclosure type {enc.get('type')!r}")
+        if int(enc.get("length") or "0") <= 10000:
+            raise ValueError(f"Invalid RSS item {title!r}: suspicious enclosure length {enc.get('length')!r}")
+
+        if not (item.findtext("itunes:duration", "", ns) or "").strip():
+            raise ValueError(f"Invalid RSS item {title!r}: missing <itunes:duration>")
+
+        item_img = item.find("itunes:image", ns)
+        if item_img is None or not (item_img.get("href") or "").strip():
+            raise ValueError(f"Invalid RSS item {title!r}: missing <itunes:image>")
+
+        body = (item.findtext("content:encoded", "", ns) or "").lower()
+        if "<form" in body or "subscription-widget" in body:
+            raise ValueError(f"Invalid RSS item {title!r}: unsanitized Substack form/widget in <content:encoded>")
 
 
 def build_podcast_rss(
@@ -132,7 +182,10 @@ def build_podcast_rss(
         )
 
     lines.extend(["  </channel>", "</rss>", ""])
-    output_xml_path.write_text("\n".join(lines), encoding="utf-8")
+    tmp_path = output_xml_path.with_suffix(".xml.tmp")
+    tmp_path.write_text("\n".join(lines), encoding="utf-8")
+    validate_podcast_xml(tmp_path)
+    tmp_path.replace(output_xml_path)
     return len(active)
 
 
