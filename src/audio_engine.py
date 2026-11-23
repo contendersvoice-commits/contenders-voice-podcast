@@ -5,21 +5,48 @@ from __future__ import annotations
 import asyncio
 from io import BytesIO
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 
 import edge_tts
 from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, ID3NoHeaderError
 from PIL import Image
 
+USER_AGENT = "ContendersVoicePodcastSync/1.0 (+https://www.contendersvoice.com/)"
+
+
+def decode_substack_cdn_url(image_url: str) -> str:
+    """Return the underlying S3/source URL if image_url is a substackcdn.com proxy URL."""
+    if "substackcdn.com/image/fetch/" in image_url:
+        for marker in ("https%3A", "http%3A"):
+            idx = image_url.find(marker)
+            if idx != -1:
+                return urllib.parse.unquote(image_url[idx:])
+    return image_url
+
 
 def prepare_square_artwork(image_url: str, dest_path: Path, size: int = 1400) -> bool:
     """Download an image, center-crop to square, resize to size x size, and save RGB JPEG."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
-    img_bytes = urllib.request.urlopen(req, timeout=25).read()
+    direct_url = decode_substack_cdn_url(image_url)
+    candidates = [direct_url, image_url] if direct_url != image_url else [image_url]
+
+    img_bytes: bytes | None = None
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            req = urllib.request.Request(candidate, headers={"User-Agent": USER_AGENT})
+            img_bytes = urllib.request.urlopen(req, timeout=25).read()
+            if img_bytes:
+                break
+        except Exception as exc:
+            last_err = exc
+    if not img_bytes:
+        raise RuntimeError(f"Failed downloading artwork {image_url}: {last_err}")
 
     with Image.open(BytesIO(img_bytes)) as img:
         if img.mode in ("RGBA", "LA", "P"):
@@ -47,10 +74,11 @@ async def _stream_edge_to_file(
     dest_path: Path,
     idle_timeout_sec: float,
     total_timeout_sec: float,
-) -> None:
+) -> list[str]:
     communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
     aiter = communicate.stream().__aiter__()
     deadline = time.monotonic() + total_timeout_sec
+    spoken_sentences: list[str] = []
     try:
         with dest_path.open("wb") as fh:
             while True:
@@ -66,9 +94,45 @@ async def _stream_edge_to_file(
                     break
                 if msg["type"] == "audio":
                     fh.write(msg["data"])
+                elif msg["type"] == "SentenceBoundary" and msg.get("text"):
+                    spoken_sentences.append(str(msg["text"]))
     finally:
         if hasattr(aiter, "aclose"):
             await aiter.aclose()
+    return spoken_sentences
+
+
+def _verify_chunk_completeness(
+    input_text: str,
+    spoken_sentences: list[str],
+    dest_path: Path,
+) -> None:
+    """Reject silent WebSocket truncation via SentenceBoundary coverage and audio duration."""
+    if not dest_path.exists() or dest_path.stat().st_size == 0:
+        raise RuntimeError(f"Empty audio file generated for chunk {dest_path.name}")
+
+    input_words = re.findall(r"[a-z0-9]+", input_text.lower())
+    if len(input_words) >= 5 and spoken_sentences:
+        spoken_words = re.findall(r"[a-z0-9]+", " ".join(spoken_sentences).lower())
+        ratio = len(spoken_words) / len(input_words)
+        if ratio < 0.88:
+            raise RuntimeError(
+                f"Incomplete stream for {dest_path.name}: {len(spoken_words)}/{len(input_words)} words ({ratio:.0%})"
+            )
+        tail = input_words[-min(3, len(input_words)) :]
+        recent = spoken_words[-8:]
+        if not any(w in recent for w in tail[-2:]):
+            raise RuntimeError(
+                f"Tail truncation in {dest_path.name}: expected tail {tail} near {recent}"
+            )
+
+    if len(input_words) >= 8:
+        duration_sec, _ = _probe_mp3(dest_path)
+        min_expected = max(1.0, len(input_words) * 0.24)
+        if duration_sec < min_expected:
+            raise RuntimeError(
+                f"Audio too short for {dest_path.name}: {duration_sec}s < {min_expected:.1f}s for {len(input_words)} words"
+            )
 
 
 async def _synthesize_chunk_with_retry(
@@ -84,7 +148,7 @@ async def _synthesize_chunk_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             dest_path.unlink(missing_ok=True)
-            await _stream_edge_to_file(
+            spoken_sentences = await _stream_edge_to_file(
                 text,
                 voice,
                 rate,
@@ -92,15 +156,14 @@ async def _synthesize_chunk_with_retry(
                 idle_timeout_sec=idle_timeout_sec,
                 total_timeout_sec=total_timeout_sec,
             )
-            if dest_path.exists() and dest_path.stat().st_size > 0:
-                return
-            raise RuntimeError(f"Empty audio file generated for chunk {dest_path.name}")
+            _verify_chunk_completeness(text, spoken_sentences, dest_path)
+            return
         except Exception as exc:
             dest_path.unlink(missing_ok=True)
             last_err = exc
             if attempt < attempts:
                 print(
-                    f"    Retry {attempt}/{attempts - 1} for {dest_path.name} ({exc.__class__.__name__})...",
+                    f"    Retry {attempt}/{attempts - 1} for {dest_path.name} ({exc})...",
                     flush=True,
                 )
                 await asyncio.sleep(2 * attempt)
@@ -170,7 +233,7 @@ async def _synthesize_all_chunks(
     rate: str,
     work_dir: Path,
 ) -> tuple[list[Path], Path | None]:
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(2)
     total = len(body_chunks) + (1 if outro_text else 0)
     completed = 0
 

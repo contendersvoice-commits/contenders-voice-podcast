@@ -134,8 +134,27 @@ def _clean_text_for_speech(text: str, pronunciations: Mapping[str, str]) -> str:
     out = _apply_pronunciations(out, pronunciations)
     out = re.sub(r",\s*,", ",", out)
     out = re.sub(r"\s+([,.;:?!])", r"\1", out)
+    out = re.sub(r"“\s+", "“", out)
+    out = re.sub(r"\s+”", "”", out)
     out = re.sub(r"\s{2,}", " ", out).strip()
     return out
+
+
+def _merge_broken_sentence_blocks(blocks: list[str]) -> list[str]:
+    """Rejoin paragraphs split mid-sentence in Substack's HTML editor."""
+    merged: list[str] = []
+    terminal_chars = (".", "!", "?", ":", ";", "”", '"', "’", ")")
+    for block in blocks:
+        if (
+            merged
+            and len(merged[-1]) >= 25
+            and not merged[-1].endswith(terminal_chars)
+            and block[0].islower()
+        ):
+            merged[-1] = f"{merged[-1]} {block}"
+        else:
+            merged.append(block)
+    return merged
 
 
 def _extract_leaf_blocks(soup: BeautifulSoup) -> list[str]:
@@ -151,14 +170,14 @@ def _extract_leaf_blocks(soup: BeautifulSoup) -> list[str]:
         if not text or DECORATIVE_LINE_RE.match(text):
             continue
         blocks.append(text)
-    return blocks
+    return _merge_broken_sentence_blocks(blocks)
 
 
 def _split_long_paragraph(text: str, max_chars: int) -> list[str]:
     """Split an extra-long paragraph on sentence boundaries so TTS stays reliable."""
     if len(text) <= max_chars:
         return [text]
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = re.split(r'(?:(?<=[.!?]["”’\')])|(?<=[.!?]))\s+', text)
     chunks: list[str] = []
     current = ""
     for sentence in sentences:
@@ -207,7 +226,11 @@ def build_spoken_chunks(
 
     for idx, block in enumerate(raw_blocks):
         norm_block = _norm_compare(block)
-        if idx < 2 and norm_block and (norm_block == norm_title or norm_block == norm_sub):
+        if (
+            idx < 5
+            and len(norm_block) >= 4
+            and (norm_block in norm_title or (norm_sub and norm_block in norm_sub))
+        ):
             continue
         paragraphs.append(block)
 
