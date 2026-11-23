@@ -66,9 +66,13 @@ def load_ignored_slugs(path: Path) -> set[str]:
 
 def _http_get_bytes(url: str, attempts: int = 3) -> bytes:
     last_err: Exception | None = None
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+    }
     for attempt in range(1, attempts + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers=headers)
             return urllib.request.urlopen(req, timeout=20).read()
         except Exception as exc:
             last_err = exc
@@ -204,9 +208,18 @@ def collect_all_available_posts(subdomain: str) -> list[dict[str, Any]]:
         if post.get("slug"):
             by_slug[post["slug"]] = post
 
-    # Live RSS takes precedence for the latest 20 posts
-    for post in fetch_rss_newsletter_posts(subdomain):
-        by_slug[post["slug"]] = post
+    try:
+        rss_posts = fetch_rss_newsletter_posts(subdomain)
+        print(f"Live RSS feed fetched cleanly ({len(rss_posts)} posts).")
+        for post in rss_posts:
+            by_slug[post["slug"]] = post
+    except Exception as exc:
+        if not by_slug:
+            raise
+        print(
+            f"Warning: live RSS fetch failed ({exc}); "
+            f"continuing with {len(by_slug)} posts from state/backfill_queue.json."
+        )
 
     merged = list(by_slug.values())
     merged.sort(key=lambda p: p.get("post_date", ""), reverse=True)
