@@ -8,6 +8,11 @@ from typing import Mapping
 
 from bs4 import BeautifulSoup, Tag
 
+try:
+    from speech_normalizer import is_non_audio_block, normalize_for_speech
+except ImportError:
+    from .speech_normalizer import is_non_audio_block, normalize_for_speech
+
 STRIP_SELECTORS = (
     "div.subscription-widget-wrap-editor",
     "div.subscription-widget",
@@ -28,7 +33,6 @@ BOILERPLATE_TAIL_RE = re.compile(
     r"^(thanks for reading|this substack is reader-supported|subscribe now)\b",
     flags=re.I,
 )
-BARE_URL_RE = re.compile(r"https?://\S+")
 
 
 def clean_post_title(raw_title: str) -> str:
@@ -113,31 +117,9 @@ def build_show_notes_html(
     return "\n".join(p for p in parts if p)
 
 
-def _apply_pronunciations(text: str, pronunciations: Mapping[str, str]) -> str:
-    """Apply longest-first, case-insensitive whole-word pronunciation replacements."""
-    if not pronunciations:
-        return text
-    ordered = sorted(pronunciations.items(), key=lambda kv: len(kv[0]), reverse=True)
-    for term, phonetic in ordered:
-        pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", flags=re.IGNORECASE)
-        text = pattern.sub(phonetic, text)
-    return text
-
-
 def _clean_text_for_speech(text: str, pronunciations: Mapping[str, str]) -> str:
-    """Normalize punctuation, brackets, abbreviations, URLs, and Hebrew terms for TTS."""
-    out = BARE_URL_RE.sub("", text)
-    out = re.sub(r"\s*\[\s*([^\]]+?)\s*\]", r", meaning \1,", out)
-    out = re.sub(r"\s*--\s*", " — ", out)
-    out = re.sub(r"\bi\.e\.", "that is,", out, flags=re.IGNORECASE)
-    out = re.sub(r"\be\.g\.", "for example,", out, flags=re.IGNORECASE)
-    out = _apply_pronunciations(out, pronunciations)
-    out = re.sub(r",\s*,", ",", out)
-    out = re.sub(r"\s+([,.;:?!])", r"\1", out)
-    out = re.sub(r"“\s+", "“", out)
-    out = re.sub(r"\s+”", "”", out)
-    out = re.sub(r"\s{2,}", " ", out).strip()
-    return out
+    """Normalize punctuation, citations, brackets, abbreviations, URLs, and Hebrew terms for TTS."""
+    return normalize_for_speech(text, pronunciations)
 
 
 def _merge_broken_sentence_blocks(blocks: list[str]) -> list[str]:
@@ -225,6 +207,8 @@ def build_spoken_chunks(
             paragraphs.append(subtitle)
 
     for idx, block in enumerate(raw_blocks):
+        if is_non_audio_block(block):
+            continue
         norm_block = _norm_compare(block)
         if (
             idx < 5
