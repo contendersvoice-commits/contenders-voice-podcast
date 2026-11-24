@@ -19,19 +19,36 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-from audio_engine import (
-    USER_AGENT,
-    decode_substack_cdn_url,
-    prepare_square_artwork,
-    synthesize_and_master_mp3,
-)
-from rss_builder import build_podcast_rss, build_web_player_html
-from text_cleaner import (
-    build_show_notes_html,
-    build_spoken_chunks,
-    clean_post_title,
-    clean_substack_html,
-)
+try:
+    from audio_engine import (
+        USER_AGENT,
+        decode_substack_cdn_url,
+        prepare_square_artwork,
+        synthesize_and_master_mp3,
+    )
+    from rss_builder import build_podcast_rss, build_web_player_html
+    from text_cleaner import (
+        build_show_notes_html,
+        build_spoken_chunks,
+        clean_post_title,
+        clean_substack_html,
+    )
+except ImportError:
+    from .audio_engine import (
+        USER_AGENT,
+        decode_substack_cdn_url,
+        prepare_square_artwork,
+        synthesize_and_master_mp3,
+    )
+    from .rss_builder import build_podcast_rss, build_web_player_html
+    from .text_cleaner import (
+        build_show_notes_html,
+        build_spoken_chunks,
+        clean_post_title,
+        clean_substack_html,
+    )
+
+PIPELINE_VERSION = 2
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT_DIR / "config"
@@ -236,13 +253,107 @@ def resolve_github_coords(settings: dict[str, Any]) -> tuple[str, str]:
     return owner, repo
 
 
-def upload_to_github_release(mp3_path: Path, release_tag: str, owner: str, repo: str) -> str:
-    """Upload MP3 to GitHub Release with --clobber and return direct download URL."""
+def upload_to_github_release(
+    mp3_path: Path,
+    release_tag: str,
+    owner: str,
+    repo: str,
+    attempts: int = 4,
+) -> str:
+    """Upload MP3 to GitHub Release with --clobber and retries for concurrent shard uploads."""
     cmd = ["gh", "release", "upload", release_tag, str(mp3_path), "--clobber"]
     if owner and owner != "REPLACE_WITH_GITHUB_USERNAME":
         cmd.extend(["--repo", f"{owner}/{repo}"])
-    subprocess.run(cmd, check=True)
-    return f"https://github.com/{owner}/{repo}/releases/download/{release_tag}/{mp3_path.name}"
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(cmd, check=True)
+            return f"https://github.com/{owner}/{repo}/releases/download/{release_tag}/{mp3_path.name}"
+        except (subprocess.CalledProcessError, OSError) as exc:
+            last_err = exc
+            if attempt < attempts:
+                wait_sec = 3 * attempt
+                print(
+                    f"  Release upload retry {attempt}/{attempts - 1} for {mp3_path.name} "
+                    f"in {wait_sec}s ({exc})..."
+                )
+                time.sleep(wait_sec)
+    raise RuntimeError(f"gh release upload failed for {mp3_path.name}: {last_err}") from last_err
+
+
+def select_pending_posts(
+    all_posts: list[dict[str, Any]],
+    episodes: dict[str, dict[str, Any]],
+    ignored_slugs: set[str],
+    order: str = "oldest",
+    upgrade_outdated: bool = False,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
+) -> list[dict[str, Any]]:
+    """Select and deterministically shard posts needing synthesis or quality upgrades."""
+    if (shard_index is None) != (shard_count is None):
+        raise ValueError("shard_index and shard_count must both be set or both be None.")
+    if shard_count is not None:
+        if shard_count < 1 or shard_index is None or not (0 <= shard_index < shard_count):
+            raise ValueError(f"Invalid shard coordinates: index={shard_index}, count={shard_count}")
+
+    pending: list[dict[str, Any]] = []
+    for post in all_posts:
+        slug = post.get("slug")
+        if not slug or slug in ignored_slugs:
+            continue
+        existing = episodes.get(slug)
+        if existing is None:
+            pending.append(post)
+        elif upgrade_outdated and int(existing.get("pipeline_version", 1)) < PIPELINE_VERSION:
+            pending.append(post)
+
+    pending.sort(
+        key=lambda p: p.get("post_date", ""),
+        reverse=(order == "newest"),
+    )
+    if shard_count is not None and shard_index is not None:
+        return [p for idx, p in enumerate(pending) if idx % shard_count == shard_index]
+    return pending
+
+
+def merge_shard_outputs(
+    shards_dir: Path,
+    state_file: Path,
+    artwork_dir: Path,
+) -> tuple[dict[str, Any], int]:
+    """Merge sharded episodes.json files and artwork into the canonical repository state."""
+    state = load_json(state_file) if state_file.exists() else {"episodes": {}}
+    episodes: dict[str, dict[str, Any]] = state.setdefault("episodes", {})
+
+    merged_slugs: set[str] = set()
+    for shard_json in sorted(shards_dir.rglob("episodes.json")):
+        shard_data = load_json(shard_json)
+        shard_eps = shard_data.get("episodes", {})
+        if not isinstance(shard_eps, dict):
+            continue
+        for slug, ep in shard_eps.items():
+            if not isinstance(ep, dict):
+                continue
+            cur = episodes.get(slug)
+            cur_ver = int(cur.get("pipeline_version", 1)) if cur else -1
+            new_ver = int(ep.get("pipeline_version", 1))
+            cur_ts = cur.get("generated_at", "") if cur else ""
+            new_ts = ep.get("generated_at", "")
+            if cur is None or new_ver > cur_ver or (new_ver == cur_ver and new_ts >= cur_ts):
+                episodes[slug] = ep
+                merged_slugs.add(slug)
+
+    artwork_dir.mkdir(parents=True, exist_ok=True)
+    for jpg in sorted(shards_dir.rglob("artwork/*.jpg")):
+        dest = artwork_dir / jpg.name
+        if jpg.name == "show-cover.jpg" and dest.exists():
+            continue
+        if jpg.resolve() != dest.resolve():
+            shutil.copy2(jpg, dest)
+
+    save_json(state_file, state)
+    return state, len(merged_slugs)
 
 
 def _build_plain_summary(subtitle: str, cleaned_soup: Any, max_len: int = 240) -> str:
@@ -291,7 +402,49 @@ def main() -> int:
         action="store_true",
         help="Export all historical Substack posts into state/backfill_queue.json.",
     )
+    mode_group.add_argument(
+        "--merge-shards-dir",
+        type=Path,
+        default=None,
+        help="Merge shard episodes.json/artwork under this directory and rebuild RSS/HTML.",
+    )
+    parser.add_argument(
+        "--upgrade-outdated",
+        action="store_true",
+        help="Also reprocess episodes generated with an older pipeline_version.",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="Zero-based worker shard index for parallel processing.",
+    )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=None,
+        help="Total number of parallel worker shards.",
+    )
+    parser.add_argument(
+        "--state-out",
+        type=Path,
+        default=None,
+        help="Write only episodes built in this run to this state file and skip RSS/HTML rebuild.",
+    )
+    parser.add_argument(
+        "--artwork-out-dir",
+        type=Path,
+        default=None,
+        help="Write episode artwork JPEGs to this directory instead of docs/artwork/.",
+    )
     args = parser.parse_args()
+
+    if (args.shard_index is None) != (args.shard_count is None):
+        raise ValueError("--shard-index and --shard-count must be passed together.")
+    if args.shard_count is not None and (
+        args.shard_count < 1 or args.shard_index is None or not (0 <= args.shard_index < args.shard_count)
+    ):
+        raise ValueError(f"Invalid shard arguments: index={args.shard_index}, count={args.shard_count}")
 
     settings = load_json(CONFIG_DIR / "settings.json")
     if args.export_backfill:
@@ -307,50 +460,77 @@ def main() -> int:
     if args.local_only:
         preview_dir = BUILD_DIR / "preview"
         audio_dir = preview_dir / "audio"
-        artwork_dir = preview_dir / "artwork"
+        artwork_dir = args.artwork_out_dir or (preview_dir / "artwork")
         state_file = BUILD_DIR / "local_episodes.json"
         out_xml = preview_dir / "podcast.xml"
         out_html = preview_dir / "index.html"
         base_pages_url = preview_dir.resolve().as_uri()
     else:
         audio_dir = BUILD_DIR / "audio"
-        artwork_dir = DOCS_DIR / "artwork"
+        artwork_dir = args.artwork_out_dir or (DOCS_DIR / "artwork")
         state_file = STATE_PATH
         out_xml = DOCS_DIR / "podcast.xml"
         out_html = DOCS_DIR / "index.html"
 
     state = load_json(state_file) if state_file.exists() else {"episodes": {}}
-    episodes: dict[str, dict[str, Any]] = state.setdefault("episodes", {})
+    baseline_episodes: dict[str, dict[str, Any]] = state.setdefault("episodes", {})
+
+    if args.merge_shards_dir is not None:
+        state, merged_count = merge_shard_outputs(
+            shards_dir=args.merge_shards_dir,
+            state_file=state_file,
+            artwork_dir=artwork_dir,
+        )
+        print(f"Merged {merged_count} shard episode(s) from {args.merge_shards_dir} -> {state_file}.")
+        baseline_episodes = state.setdefault("episodes", {})
 
     show_cover_path = artwork_dir / "show-cover.jpg"
+    repo_show_cover = DOCS_DIR / "artwork" / "show-cover.jpg"
     if not show_cover_path.exists():
-        print("Preparing 1400x1400 show cover artwork...")
-        prepare_square_artwork(settings["show_logo_source_url"], show_cover_path)
+        if repo_show_cover.exists() and repo_show_cover.resolve() != show_cover_path.resolve():
+            show_cover_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(repo_show_cover, show_cover_path)
+        else:
+            print("Preparing 1400x1400 show cover artwork...")
+            prepare_square_artwork(settings["show_logo_source_url"], show_cover_path)
 
     failed_slugs: list[str] = []
-    if not args.rebuild_only:
+    if not args.rebuild_only and args.merge_shards_dir is None:
         if args.publish_releases and (not owner or owner == "REPLACE_WITH_GITHUB_USERNAME"):
             raise RuntimeError(
                 "github_owner is still REPLACE_WITH_GITHUB_USERNAME in config/settings.json "
                 "and GITHUB_REPOSITORY is not set."
             )
 
+        out_state_file = args.state_out or state_file
+        if args.state_out is not None:
+            shard_state: dict[str, Any] = {"episodes": {}}
+            target_episodes = shard_state["episodes"]
+            save_json(out_state_file, shard_state)
+        else:
+            shard_state = state
+            target_episodes = baseline_episodes
+
         print(f"Fetching newsletter RSS feed for {settings['substack_subdomain']}.substack.com...")
         all_posts = collect_all_available_posts(settings["substack_subdomain"])
-        pending = [
-            p
-            for p in all_posts
-            if p.get("slug")
-            and p["slug"] not in episodes
-            and p["slug"] not in ignored_slugs
-        ]
-        pending.sort(
-            key=lambda p: p.get("post_date", ""),
-            reverse=(args.order == "newest"),
+        pending = select_pending_posts(
+            all_posts=all_posts,
+            episodes=baseline_episodes,
+            ignored_slugs=ignored_slugs,
+            order=args.order,
+            upgrade_outdated=args.upgrade_outdated,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
+        )
+        shard_desc = (
+            f", shard={args.shard_index}/{args.shard_count}"
+            if args.shard_count is not None
+            else ""
         )
         print(
             f"Found {len(all_posts)} written posts total; "
-            f"{len(pending)} pending synthesis (order={args.order}, limit={args.limit})."
+            f"{len(pending)} pending synthesis (order={args.order}, limit={args.limit}"
+            f", upgrade_outdated={args.upgrade_outdated}{shard_desc})."
         )
 
         to_process = pending[: max(0, args.limit)]
@@ -419,7 +599,7 @@ def main() -> int:
                 else:
                     audio_url = mp3_path.resolve().as_uri()
 
-                episodes[slug] = {
+                target_episodes[slug] = {
                     "slug": slug,
                     "title": title,
                     "subtitle": subtitle,
@@ -433,32 +613,39 @@ def main() -> int:
                     "artwork_url": ep_art_url,
                     "local_audio_rel": f"audio/{slug}.mp3",
                     "local_artwork_rel": f"artwork/{slug}.jpg",
+                    "pipeline_version": PIPELINE_VERSION,
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
-                save_json(state_file, state)
+                save_json(out_state_file, shard_state)
                 time.sleep(0.25)
             except Exception as exc:
                 mp3_path.unlink(missing_ok=True)
                 failed_slugs.append(slug)
                 print(f"  ERROR processing {slug}: {exc}", file=sys.stderr)
 
-    rss_count = build_podcast_rss(
-        settings=settings,
-        episodes=episodes,
-        ignored_slugs=ignored_slugs,
-        base_pages_url=base_pages_url,
-        output_xml_path=out_xml,
-        show_cover_href="artwork/show-cover.jpg" if args.local_only else None,
-        feed_self_href="podcast.xml" if args.local_only else None,
-    )
-    html_count = build_web_player_html(
-        settings=settings,
-        episodes=episodes,
-        ignored_slugs=ignored_slugs,
-        output_html_path=out_html,
-        local_preview=args.local_only,
-    )
-    print(f"Built {out_xml} ({rss_count} episodes) and {out_html} ({html_count} episodes).")
+    if args.state_out is not None and not args.rebuild_only and args.merge_shards_dir is None:
+        print(
+            f"Saved shard output ({len(target_episodes)} episodes) -> {out_state_file} "
+            "(skipped RSS/HTML rebuild)."
+        )
+    else:
+        rss_count = build_podcast_rss(
+            settings=settings,
+            episodes=baseline_episodes,
+            ignored_slugs=ignored_slugs,
+            base_pages_url=base_pages_url,
+            output_xml_path=out_xml,
+            show_cover_href="artwork/show-cover.jpg" if args.local_only else None,
+            feed_self_href="podcast.xml" if args.local_only else None,
+        )
+        html_count = build_web_player_html(
+            settings=settings,
+            episodes=baseline_episodes,
+            ignored_slugs=ignored_slugs,
+            output_html_path=out_html,
+            local_preview=args.local_only,
+        )
+        print(f"Built {out_xml} ({rss_count} episodes) and {out_html} ({html_count} episodes).")
     if failed_slugs:
         print(f"FAILED_EPISODES: {', '.join(failed_slugs)}", file=sys.stderr)
         return 1

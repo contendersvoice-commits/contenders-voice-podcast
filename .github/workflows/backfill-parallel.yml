@@ -1,0 +1,151 @@
+name: Parallel Backfill & Quality Upgrade
+
+on:
+  workflow_dispatch:
+    inputs:
+      upgrade_outdated:
+        description: "Reprocess existing episodes built with older speech rules"
+        required: false
+        default: true
+        type: boolean
+      limit_per_shard:
+        description: "Max episodes per shard (6 shards total; 15 covers full catalog)"
+        required: false
+        default: "15"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: podcast-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Ensure audio-archive GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view audio-archive || gh release create audio-archive \
+            --title "Contender's Voice Audio Archive" \
+            --notes "Automated MP3 audio editions of Contender's Voice Substack posts."
+
+  shard:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure FFmpeg and Python dependencies are installed
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          pip install --no-cache-dir --default-timeout=30 -r requirements.txt
+
+      - name: Synthesize shard ${{ matrix.shard }} of 6
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LIMIT="${{ inputs.limit_per_shard }}"
+          if [ -z "$LIMIT" ]; then
+            LIMIT="15"
+          fi
+          UPGRADE_FLAG=""
+          if [ "${{ inputs.upgrade_outdated }}" = "true" ]; then
+            UPGRADE_FLAG="--upgrade-outdated"
+          fi
+          set +e
+          python src/sync_podcast.py \
+            --publish-releases \
+            $UPGRADE_FLAG \
+            --shard-index "${{ matrix.shard }}" \
+            --shard-count 6 \
+            --limit "$LIMIT" \
+            --order oldest \
+            --state-out build/shard/episodes.json \
+            --artwork-out-dir build/shard/artwork
+          SYNC_EXIT=$?
+          set -e
+          echo "sync_exit=$SYNC_EXIT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload shard output artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podcast-shard-${{ matrix.shard }}
+          path: build/shard
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Fail shard if any episode errored
+        if: steps.sync.outputs.sync_exit != '0'
+        run: |
+          echo "Shard ${{ matrix.shard }} finished with exit ${{ steps.sync.outputs.sync_exit }}; partial outputs preserved."
+          exit "${{ steps.sync.outputs.sync_exit }}"
+
+  merge:
+    needs: [prepare, shard]
+    if: always() && needs.prepare.result == 'success' && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir --default-timeout=30 -r requirements.txt
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: podcast-shard-*
+          path: build/shards
+          merge-multiple: false
+
+      - name: Refresh latest main before merging
+        run: git pull --ff-only origin main
+
+      - name: Merge shard state, artwork, and rebuild RSS/HTML
+        run: python src/sync_podcast.py --merge-shards-dir build/shards
+
+      - name: Commit updated state and RSS feed
+        run: |
+          git config user.name "Contender's Voice Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/episodes.json docs/
+          if ! git diff --cached --quiet; then
+            git commit -m "Merge parallel backfill podcast feed"
+            git push
+          else
+            echo "No feed changes to commit."
+          fi
+
+      - name: Check if any shard failed
+        if: needs.shard.result != 'success'
+        run: |
+          echo "At least one shard had an error; completed episodes were merged and saved."
+          exit 1
