@@ -15,5 +15,6 @@
   "sample_rate": 44100,
   "github_owner": "contendersvoice-commits",
   "github_repo": "contenders-voice-podcast",
-  "release_tag": "audio-archive"
+  "release_tag": "audio-archive",
+  "audio_base_url": "https://contenders-voice-audio.contendersvoice.workers.dev"
 }

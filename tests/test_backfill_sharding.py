@@ -5,7 +5,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from src.sync_podcast import PIPELINE_VERSION, merge_shard_outputs, select_pending_posts
+from src.sync_podcast import (
+    PIPELINE_VERSION,
+    build_public_audio_url,
+    merge_shard_outputs,
+    select_pending_posts,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -120,3 +125,25 @@ class TestBackfillSharding(unittest.TestCase):
             self.assertEqual(eps["ep-1"]["pipeline_version"], 2)
             self.assertEqual((artwork_dir / "ep-1.jpg").read_bytes(), b"jpg-1")
             self.assertEqual((artwork_dir / "ep-2.jpg").read_bytes(), b"jpg-2")
+
+    def test_build_public_audio_url_with_and_without_proxy(self) -> None:
+        self.assertEqual(
+            build_public_audio_url(
+                "ep-1.mp3",
+                release_tag="audio-archive",
+                owner="o",
+                repo="r",
+                audio_base_url="https://contenders-voice-audio.contendersvoice.workers.dev/",
+            ),
+            "https://contenders-voice-audio.contendersvoice.workers.dev/ep-1.mp3",
+        )
+        self.assertEqual(
+            build_public_audio_url(
+                "ep-1.mp3",
+                release_tag="audio-archive",
+                owner="o",
+                repo="r",
+                audio_base_url="",
+            ),
+            "https://github.com/o/r/releases/download/audio-archive/ep-1.mp3",
+        )

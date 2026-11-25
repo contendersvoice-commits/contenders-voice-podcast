@@ -253,14 +253,29 @@ def resolve_github_coords(settings: dict[str, Any]) -> tuple[str, str]:
     return owner, repo
 
 
+def build_public_audio_url(
+    filename: str,
+    release_tag: str,
+    owner: str,
+    repo: str,
+    audio_base_url: str = "",
+) -> str:
+    """Return the public podcast enclosure URL (iOS-friendly proxy when configured)."""
+    base = (audio_base_url or "").strip().rstrip("/")
+    if base:
+        return f"{base}/{filename}"
+    return f"https://github.com/{owner}/{repo}/releases/download/{release_tag}/{filename}"
+
+
 def upload_to_github_release(
     mp3_path: Path,
     release_tag: str,
     owner: str,
     repo: str,
     attempts: int = 4,
+    audio_base_url: str = "",
 ) -> str:
-    """Upload MP3 to GitHub Release with --clobber and retries for concurrent shard uploads."""
+    """Upload MP3 to GitHub Release with --clobber and return public enclosure URL."""
     cmd = ["gh", "release", "upload", release_tag, str(mp3_path), "--clobber"]
     if owner and owner != "REPLACE_WITH_GITHUB_USERNAME":
         cmd.extend(["--repo", f"{owner}/{repo}"])
@@ -268,7 +283,13 @@ def upload_to_github_release(
     for attempt in range(1, attempts + 1):
         try:
             subprocess.run(cmd, check=True)
-            return f"https://github.com/{owner}/{repo}/releases/download/{release_tag}/{mp3_path.name}"
+            return build_public_audio_url(
+                mp3_path.name,
+                release_tag=release_tag,
+                owner=owner,
+                repo=repo,
+                audio_base_url=audio_base_url,
+            )
         except (subprocess.CalledProcessError, OSError) as exc:
             last_err = exc
             if attempt < attempts:
@@ -593,7 +614,11 @@ def main() -> int:
 
                 if args.publish_releases:
                     audio_url = upload_to_github_release(
-                        mp3_path, settings["release_tag"], owner, repo
+                        mp3_path,
+                        settings["release_tag"],
+                        owner,
+                        repo,
+                        audio_base_url=settings.get("audio_base_url", ""),
                     )
                     mp3_path.unlink(missing_ok=True)
                 else:
